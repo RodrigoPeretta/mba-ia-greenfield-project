@@ -37,6 +37,19 @@ describe('Database migrations (integration)', () => {
       ),
       dataSource.query(`DROP TABLE IF EXISTS "migrations" CASCADE`),
     ]);
+
+    // Enum types outlive their tables (created by previous migration runs or by
+    // other suites' `synchronize`), so the migrations' CREATE TYPE would fail.
+    const enumTypes = await dataSource.query<{ typname: string }[]>(
+      `SELECT t.typname FROM pg_type t
+       JOIN pg_namespace n ON n.oid = t.typnamespace
+       WHERE n.nspname = 'public' AND t.typtype = 'e'`,
+    );
+    await Promise.all(
+      enumTypes.map(({ typname }) =>
+        dataSource.query(`DROP TYPE IF EXISTS "public"."${typname}" CASCADE`),
+      ),
+    );
   });
 
   afterAll(async () => {
