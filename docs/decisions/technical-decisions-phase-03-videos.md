@@ -45,6 +45,12 @@ _Subprojects in scope:_
 **Recommendation:** **Option A (BullMQ + Redis)** — the phase has one job type with long execution, and BullMQ gives exactly the job semantics TD-11 needs (attempts, backoff, unrecoverable errors, deduplication by `jobId`, stalled detection) through an official Nest module, while adding a real queue container that matches the C4 diagram; the non-transactional enqueue is a known trade-off handled by idempotency and reconciliation in TD-11. pg-boss is the strongest alternative if avoiding a new service were a priority, which the challenge explicitly does not reward. Image choice (Redis 8 vs Valkey) is pinned in `library-refs.md` by `plan-resolve`.
 
 **Decision:** A (BullMQ + Redis via `@nestjs/bullmq`)
+**Libraries:** @nestjs/bullmq, bullmq
+
+**Revisions:**
+
+- 2026-10-24 — `**Libraries:**` filled with the packages of the decided option (`@nestjs/bullmq`, `bullmq`). Rationale: Libraries field filled from the decided option (validation IC-1).
+- 2026-10-24 — Broker image fixed as Valkey 8 (`valkey/valkey`, BSD-3, Redis-protocol compatible) instead of Redis 8; exact tag pinned in `library-refs.md`. Rationale: avoids Redis 8's AGPLv3/RSAL/SSPL licensing with no API change for BullMQ (validation OQ-1).
 
 ---
 
@@ -292,6 +298,11 @@ _Subprojects in scope:_
 **Recommendation:** **Option A (presigned GET + native Range/206)** — satisfies streaming and download with zero bytes through the API, uses capabilities S3/MinIO already provide, and matches the C4 diagram; HLS (C) stays a future evolution that fits under the per-video prefix of TD-04. Only `ready` videos are streamable/downloadable; access rules by visibility (public/unlisted/anonymous) belong to Phases 04–05 and are set for this phase in the plan's Authorization Matrix. Depends on TD-04 and TD-05.
 
 **Decision:** A (Presigned GET + native Range/206; `attachment` disposition for download)
+**Libraries:** —
+
+**Revisions:**
+
+- 2026-10-24 — Phase 03 access rule for stream/download fixed: owner only (JWT guard + ownership check; other callers get 404), and only for `ready` videos; Phase 04 publication/visibility reopens the rule for public/unlisted/anonymous access. Rationale: no publication exists in Phase 03, so every video is effectively unpublished (validation AMB-1).
 
 ---
 
@@ -354,6 +365,33 @@ _Subprojects in scope:_
 
 ---
 
+## TD-12: S3 Client Library for API and Worker
+
+**Scope:** Backend
+
+**Capability:** Transversal — covers: Serviço de armazenamento de arquivos (vídeos e thumbnails); Upload de vídeos com suporte a arquivos de até 10GB sem impacto na performance; Geração automática de thumbnail a partir de um frame do vídeo; Reprodução via streaming (sem necessidade de download completo); Download do vídeo pelo usuário
+
+**Context:** TD-02, TD-04, TD-05, TD-07, TD-09 and TD-11 fix the storage protocol (multipart create/complete/abort, presigned part URLs, `HeadObject`, presigned GET with `attachment` disposition, thumbnail `PutObject`) but no TD chooses the client library that executes it — `nestjs-project/package.json` has no S3 dependency today. The same library is used by the API (handshake, presigning) and the worker (presigned read for ffprobe/ffmpeg, thumbnail upload), and it must support TD-05's two-instance split (internal `S3_ENDPOINT` for operations, `S3_PUBLIC_ENDPOINT` only for signing) against MinIO in dev and AWS S3 in production. Raised by `validation.md` MD-1.
+
+**Options:**
+
+### Option A: AWS SDK for JavaScript v3 (`@aws-sdk/client-s3` + `@aws-sdk/s3-request-presigner`)
+- Modular official SDK: one `S3Client` per endpoint (`endpoint`, `region`, `forcePathStyle: true` for MinIO) and typed commands (`CreateMultipartUploadCommand`, `UploadPartCommand`, `CompleteMultipartUploadCommand`, `AbortMultipartUploadCommand`, `HeadObjectCommand`, `GetObjectCommand` with `ResponseContentDisposition`, `PutObjectCommand`). `getSignedUrl(client, command, { expiresIn })` presigns any command, including individual multipart parts.
+- **Pros:** Every operation TD-02/TD-09/TD-11 needs is a public, typed command; presigning is a local SigV4 computation (no network call), so the public-endpoint client never has to reach `localhost:9000` from inside a container; identical code against AWS S3 in production (TD-05's prod split, TD-11's `AbortIncompleteMultipartUpload` lifecycle rule).
+- **Cons:** Since v3.729 the S3 client adds CRC32 checksums by default (`requestChecksumCalculation: WHEN_SUPPORTED`), a known source of incompatibility with S3-compatible backends and presigned uploads — both clients must be built with `requestChecksumCalculation` / `responseChecksumValidation: 'WHEN_REQUIRED'`. Two packages and a larger dependency tree; verbose command style.
+
+### Option B: MinIO JavaScript client (`minio` 8.x)
+- Single package with high-level methods (`presignedUrl`, `presignedGetObject`, `statObject`, `putObject`, `completeMultipartUpload`); works against any S3-compatible storage, including AWS S3.
+- **Pros:** One dependency, compact API, maintained by the storage vendor used in dev.
+- **Cons:** Multipart initiation (`initiateNewMultipartUpload`) is marked `@internal`, and part presigning is only possible through the generic `presignedUrl('PUT', …, { uploadId, partNumber })` — the core of TD-02 rests on non-public or untyped surfaces. `presignedUrl` resolves the bucket region with a `GET ?location` network call unless `region` is set at construction; on the public-endpoint client that call would target `localhost:9000` from inside the container and fail (TD-05). Less idiomatic for the production AWS S3 target.
+
+**Recommendation:** **Option A (AWS SDK v3)** — it is the only option where the whole TD-02 handshake (create, presign part, complete, abort) and TD-09's `attachment` download are public, typed operations, and its offline presigning fits TD-05's internal/public split with no extra configuration; the checksum default is a one-line, documented client setting (`WHEN_REQUIRED`) applied to both instances. Depends on TD-02, TD-04, TD-05 and TD-09.
+
+**Decision:** A (AWS SDK v3 — `@aws-sdk/client-s3` + `@aws-sdk/s3-request-presigner`; both clients with `requestChecksumCalculation` / `responseChecksumValidation: 'WHEN_REQUIRED'`)
+**Libraries:** @aws-sdk/client-s3, @aws-sdk/s3-request-presigner
+
+---
+
 ## Decisions Summary
 
 | ID | Scope | Decision | Recommendation | Choice |
@@ -369,3 +407,4 @@ _Subprojects in scope:_
 | TD-09 | Cross-layer | Streaming and download delivery | **A** (presigned GET + native Range/206; `attachment` disposition for download) | A |
 | TD-10 | Cross-layer | Video status model | **B** (`draft → processing → ready \| failed`; publication separate in Phase 04) | B |
 | TD-11 | Backend | Processing failure, retry and orphan handling | **A** (3 attempts + backoff, `UnrecoverableError`, `failed` + reason, dedup by `jobId`, reconciliation, multipart lifecycle rule) | A |
+| TD-12 | Backend | S3 client library for API and worker | **A** (AWS SDK v3 `@aws-sdk/client-s3` + `@aws-sdk/s3-request-presigner`) | A |
