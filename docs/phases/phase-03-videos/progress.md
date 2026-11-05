@@ -1,7 +1,7 @@
 # phase-03-videos — Progress
 
 **Status:** in_progress
-**SIs:** 3/12 completed
+**SIs:** 4/12 completed
 
 ### SI-03.1 — Infra: broker de fila, object storage e FFmpeg no ambiente Docker
 - **Status:** completed
@@ -33,9 +33,14 @@
   - Avisos pré-existentes fora do escopo: `pg` `DeprecationWarning` (client.query concorrente) nas suites de DB e 23 warnings `no-unsafe-argument` em `auth.service*.spec`.
 
 ### SI-03.4 — Endpoint POST /videos (pré-cadastro do rascunho + início do multipart)
-- **Status:** pending
-- **Tests:** —
-- **Observations:** none
+- **Status:** completed
+- **Tests:** 31 passing (25 em 4 suites unit/integration + 6 no e2e `test/videos-initiate-upload.e2e-spec.ts`); `tsc --noEmit` OK; ESLint 0 erros nos arquivos do SI
+- **Observations:**
+  - **MinIO não lista multiparts por prefixo:** `ListMultipartUploads` só devolve uploads quando o `Prefix` é a chave exata (verificado empiricamente). A limpeza dos testes aborta os multiparts a partir dos `upload_id` gravados em `videos`, e o "nenhum multipart aberto" do cenário 2.2 do spec é garantido pela ordem do service (tipo/tamanho validados antes de tocar DB e storage), coberto no unit test e pela ausência de registro no e2e.
+  - Criado `test/helpers/videos-e2e.helpers.ts` (bootstrap com pipe/filtros do `main.ts`, reset de storage/tabelas/throttler e usuário confirmado com login) para reuso nos e2e de SI-03.5, SI-03.6 e SI-03.11.
+  - `videos.module.spec.ts` (SI-03.3) atualizado: o módulo agora importa `StorageModule`/`ChannelsModule` e precisa do `ConfigModule` global com `storage`/`videos`.
+  - `ChannelsService` já era exportado por `ChannelsModule`; só `findByUserId` foi acrescentado. Usuário sem canal gera `Error` genérico (500), pois o Error Catalog não prevê esse caso e todo usuário nasce com canal.
+  - **Follow-up fora de escopo:** a detecção de violação `23505` por coluna está duplicada entre `channels.service.ts` e `video-uploads.service.ts`; vale extrair para um util comum.
 
 ### SI-03.5 — Endpoints de partes do upload: URLs assinadas, retomada e cancelamento
 - **Status:** pending
