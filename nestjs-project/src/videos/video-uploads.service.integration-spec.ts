@@ -1,3 +1,4 @@
+import { randomBytes } from 'crypto';
 import { ConfigModule } from '@nestjs/config';
 import { Test, type TestingModule } from '@nestjs/testing';
 import { TypeOrmModule } from '@nestjs/typeorm';
@@ -16,6 +17,7 @@ import {
 import { User } from '../users/entities/user.entity';
 import { Video, VideoStatus } from './entities/video.entity';
 import { VideoUploadsService } from './video-uploads.service';
+import { VideoNotFoundException } from './videos.exceptions';
 import { VideosModule } from './videos.module';
 
 const ALL_ENTITIES = [User, Channel, RefreshToken, VerificationToken, Video];
@@ -125,5 +127,65 @@ describe('VideoUploadsService (integration — DB + MinIO)', () => {
 
     expect(await videoRepository.count()).toBe(0);
     spy.mockRestore();
+  });
+
+  describe('parts and cancel', () => {
+    const PART_BYTES = 5 * 1024 * 1024;
+
+    async function initiateDraft(userId: string): Promise<Video> {
+      const { id } = await service.initiate(userId, {
+        filename: 'aula.mp4',
+        content_type: 'video/mp4',
+        size_bytes: 157286400,
+      });
+      return videoRepository.findOneByOrFail({ id });
+    }
+
+    it('should list a part uploaded through a signed URL', async () => {
+      const { user } = await createUserWithChannel();
+      const video = await initiateDraft(user.id);
+
+      const { parts } = await service.presignParts(user.id, video.id, [1]);
+      const response = await fetch(parts[0].url, {
+        method: 'PUT',
+        body: Uint8Array.from(randomBytes(PART_BYTES)),
+      });
+      expect(response.status).toBe(200);
+      const etag = response.headers.get('etag');
+
+      const uploaded = await service.listUploadedParts(user.id, video.id);
+
+      expect(uploaded).toEqual({
+        parts: [{ part_number: 1, etag, size: PART_BYTES }],
+        part_size: 67108864,
+        part_count: 3,
+      });
+    });
+
+    it('should abort the multipart and delete the draft on cancel', async () => {
+      const { user } = await createUserWithChannel();
+      const video = await initiateDraft(user.id);
+
+      await service.cancel(user.id, video.id);
+
+      expect(await videoRepository.findOneBy({ id: video.id })).toBeNull();
+      await expect(
+        storage.listParts(videoObjectKeys(video.id).original, video.upload_id!),
+      ).rejects.toMatchObject({ name: 'NoSuchUpload' });
+    });
+
+    it("should hide another user's draft as VideoNotFoundException", async () => {
+      const { user } = await createUserWithChannel();
+      const video = await initiateDraft(user.id);
+      const stranger = await dataSource.getRepository(User).save({
+        email: 'stranger@example.com',
+        password: 'hashed',
+      });
+
+      await expect(
+        service.cancel(stranger.id, video.id),
+      ).rejects.toBeInstanceOf(VideoNotFoundException);
+      expect(await videoRepository.findOneBy({ id: video.id })).not.toBeNull();
+    });
   });
 });

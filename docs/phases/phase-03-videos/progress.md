@@ -1,7 +1,7 @@
 # phase-03-videos — Progress
 
 **Status:** in_progress
-**SIs:** 4/12 completed
+**SIs:** 5/12 completed
 
 ### SI-03.1 — Infra: broker de fila, object storage e FFmpeg no ambiente Docker
 - **Status:** completed
@@ -43,9 +43,13 @@
   - **Follow-up fora de escopo:** a detecção de violação `23505` por coluna está duplicada entre `channels.service.ts` e `video-uploads.service.ts`; vale extrair para um util comum.
 
 ### SI-03.5 — Endpoints de partes do upload: URLs assinadas, retomada e cancelamento
-- **Status:** pending
-- **Tests:** —
-- **Observations:** none
+- **Status:** completed
+- **Tests:** 44 passing (37 nas suites unit + integration de `VideoUploadsService` + 7 no e2e `test/videos-upload-parts.e2e-spec.ts`); `tsc --noEmit` OK; ESLint 0 erros
+- **Observations:**
+  - `findOwnDraft` faz uma única query com filtro pela relação (`where: { id, channel: { user_id } }`), conforme a Authorization Matrix — inexistente e alheio dão o mesmo `404` sem consultar o canal antes. Draft sem `upload_id` é tratado como `INVALID_VIDEO_STATE`.
+  - `cancel` não apaga o rascunho se o abort falhar por outro motivo que não `NoSuchUpload` (o erro propaga); com `NoSuchUpload` (ou abort idempotente do MinIO) o rascunho é removido.
+  - Os DTOs de resposta ganharam `@ApiProperty` em todos os campos, por `.claude/rules/nestjs-dtos.md`; isso incluiu corrigir o `InitiateUploadResponseDto` do SI-03.4, que tinha ficado só com JSDoc.
+  - `listUploadedParts` deixa propagar `NoSuchUpload` (500) se o multipart expirou pelo `MINIO_API_STALE_UPLOADS_EXPIRY` antes da reconciliação do SI-03.10 — caso não previsto no Error Catalog.
 
 ### SI-03.6 — Endpoint POST /videos/:id/upload/complete e publicação do job de processamento
 - **Status:** pending

@@ -10,7 +10,10 @@ import {
   VideoUploadsService,
 } from './video-uploads.service';
 import {
+  InvalidPartNumberException,
+  InvalidVideoStateException,
   UnsupportedVideoTypeException,
+  VideoNotFoundException,
   VideoTooLargeException,
 } from './videos.exceptions';
 
@@ -18,6 +21,8 @@ const PART_SIZE = 64 * 1024 * 1024;
 const MAX_SIZE = 10 * 1024 * 1024 * 1024;
 const CHANNEL_ID = 'c0000000-0000-4000-8000-000000000001';
 const VIDEO_ID = 'v0000000-0000-4000-8000-000000000001';
+const URL_TTL = 3600;
+const ORIGINAL_KEY = `videos/${VIDEO_ID}/original`;
 
 const slugViolation = (): QueryFailedError =>
   new QueryFailedError('INSERT', [], {
@@ -32,9 +37,15 @@ describe('VideoUploadsService', () => {
     save: jest.fn(),
     update: jest.fn(),
     delete: jest.fn(),
+    findOne: jest.fn(),
   };
   const channelsService = { findByUserId: jest.fn() };
-  const storageService = { createMultipartUpload: jest.fn() };
+  const storageService = {
+    createMultipartUpload: jest.fn(),
+    presignUploadPart: jest.fn(),
+    listParts: jest.fn(),
+    abortMultipartUpload: jest.fn(),
+  };
 
   const validDto = {
     filename: 'aula.mp4',
@@ -58,7 +69,11 @@ describe('VideoUploadsService', () => {
         { provide: StorageService, useValue: storageService },
         {
           provide: videosConfig.KEY,
-          useValue: { maxSizeBytes: MAX_SIZE, uploadPartSizeBytes: PART_SIZE },
+          useValue: {
+            maxSizeBytes: MAX_SIZE,
+            uploadPartSizeBytes: PART_SIZE,
+            uploadUrlTtlSeconds: URL_TTL,
+          },
         },
       ],
     }).compile();
@@ -170,6 +185,158 @@ describe('VideoUploadsService', () => {
     });
 
     expect(result.upload.part_count).toBe(count);
+  });
+
+  describe('own draft operations', () => {
+    const draft = (overrides: Partial<Video> = {}): Partial<Video> => ({
+      id: VIDEO_ID,
+      channel_id: CHANNEL_ID,
+      status: VideoStatus.DRAFT,
+      size_bytes: 157286400,
+      upload_id: 'upload-1',
+      ...overrides,
+    });
+
+    const operations: [string, () => Promise<unknown>][] = [
+      ['presignParts', () => service.presignParts('user-1', VIDEO_ID, [1])],
+      [
+        'listUploadedParts',
+        () => service.listUploadedParts('user-1', VIDEO_ID),
+      ],
+      ['cancel', () => service.cancel('user-1', VIDEO_ID)],
+    ];
+
+    it('should look the video up by id filtered by the caller channel owner', async () => {
+      repo.findOne.mockResolvedValue(draft());
+      storageService.listParts.mockResolvedValue([]);
+
+      await service.listUploadedParts('user-1', VIDEO_ID);
+
+      expect(repo.findOne).toHaveBeenCalledWith({
+        where: { id: VIDEO_ID, channel: { user_id: 'user-1' } },
+      });
+    });
+
+    it.each(operations)(
+      '%s should throw VideoNotFoundException for a missing or foreign video',
+      async (_name, run) => {
+        repo.findOne.mockResolvedValue(null);
+
+        await expect(run()).rejects.toBeInstanceOf(VideoNotFoundException);
+        expect(storageService.presignUploadPart).not.toHaveBeenCalled();
+        expect(storageService.listParts).not.toHaveBeenCalled();
+        expect(storageService.abortMultipartUpload).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(operations)(
+      '%s should throw InvalidVideoStateException for a video outside draft',
+      async (_name, run) => {
+        repo.findOne.mockResolvedValue(
+          draft({ status: VideoStatus.PROCESSING }),
+        );
+
+        await expect(run()).rejects.toBeInstanceOf(InvalidVideoStateException);
+        expect(repo.delete).not.toHaveBeenCalled();
+      },
+    );
+
+    describe('presignParts', () => {
+      beforeEach(() => {
+        repo.findOne.mockResolvedValue(draft());
+        storageService.presignUploadPart.mockImplementation(
+          (_key: string, _uploadId: string, n: number) =>
+            Promise.resolve(`http://minio:9000/signed?partNumber=${n}`),
+        );
+      });
+
+      it.each([[[0]], [[4]], [[1, 999]]])(
+        'should reject %j in a 3-part upload with InvalidPartNumberException',
+        async (partNumbers) => {
+          await expect(
+            service.presignParts('user-1', VIDEO_ID, partNumbers),
+          ).rejects.toBeInstanceOf(InvalidPartNumberException);
+          expect(storageService.presignUploadPart).not.toHaveBeenCalled();
+        },
+      );
+
+      it('should sign every requested part with the upload TTL', async () => {
+        const result = await service.presignParts('user-1', VIDEO_ID, [1, 3]);
+
+        expect(storageService.presignUploadPart).toHaveBeenCalledWith(
+          ORIGINAL_KEY,
+          'upload-1',
+          1,
+          URL_TTL,
+        );
+        expect(storageService.presignUploadPart).toHaveBeenCalledWith(
+          ORIGINAL_KEY,
+          'upload-1',
+          3,
+          URL_TTL,
+        );
+        expect(result).toEqual({
+          parts: [
+            { part_number: 1, url: 'http://minio:9000/signed?partNumber=1' },
+            { part_number: 3, url: 'http://minio:9000/signed?partNumber=3' },
+          ],
+          expires_in: URL_TTL,
+        });
+      });
+    });
+
+    describe('listUploadedParts', () => {
+      it('should return the storage parts with the part plan', async () => {
+        repo.findOne.mockResolvedValue(draft());
+        const parts = [{ part_number: 1, etag: '"e1"', size: 5242880 }];
+        storageService.listParts.mockResolvedValue(parts);
+
+        const result = await service.listUploadedParts('user-1', VIDEO_ID);
+
+        expect(storageService.listParts).toHaveBeenCalledWith(
+          ORIGINAL_KEY,
+          'upload-1',
+        );
+        expect(result).toEqual({ parts, part_size: PART_SIZE, part_count: 3 });
+      });
+    });
+
+    describe('cancel', () => {
+      beforeEach(() => {
+        repo.findOne.mockResolvedValue(draft());
+      });
+
+      it('should abort the multipart and delete the draft', async () => {
+        storageService.abortMultipartUpload.mockResolvedValue(true);
+
+        await service.cancel('user-1', VIDEO_ID);
+
+        expect(storageService.abortMultipartUpload).toHaveBeenCalledWith(
+          ORIGINAL_KEY,
+          'upload-1',
+        );
+        expect(repo.delete).toHaveBeenCalledWith({ id: VIDEO_ID });
+      });
+
+      it('should still delete the draft when the upload is already gone (NoSuchUpload)', async () => {
+        storageService.abortMultipartUpload.mockResolvedValue(false);
+
+        await service.cancel('user-1', VIDEO_ID);
+
+        expect(repo.delete).toHaveBeenCalledWith({ id: VIDEO_ID });
+      });
+
+      it('should keep the draft when the abort fails for another reason', async () => {
+        storageService.abortMultipartUpload.mockRejectedValue(
+          new Error('storage down'),
+        );
+
+        await expect(service.cancel('user-1', VIDEO_ID)).rejects.toThrow(
+          'storage down',
+        );
+        expect(repo.delete).not.toHaveBeenCalled();
+      });
+    });
   });
 });
 

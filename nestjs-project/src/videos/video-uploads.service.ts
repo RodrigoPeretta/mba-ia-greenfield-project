@@ -17,8 +17,13 @@ import {
   VIDEO_SLUG_MAX_ATTEMPTS,
   VIDEO_TITLE_MAX_LENGTH,
 } from './videos.constants';
+import type { PresignPartsResponseDto } from './dto/presign-parts-response.dto';
+import type { UploadedPartsResponseDto } from './dto/uploaded-parts-response.dto';
 import {
+  InvalidPartNumberException,
+  InvalidVideoStateException,
   UnsupportedVideoTypeException,
+  VideoNotFoundException,
   VideoTooLargeException,
 } from './videos.exceptions';
 
@@ -89,7 +94,6 @@ export class VideoUploadsService {
       { upload_id: uploadId },
     );
 
-    const partSize = this.config.uploadPartSizeBytes;
     return {
       id: video.id,
       slug: video.slug,
@@ -97,10 +101,87 @@ export class VideoUploadsService {
       status: VideoStatus.DRAFT,
       size_bytes: video.size_bytes,
       upload: {
-        part_size: partSize,
-        part_count: Math.ceil(dto.size_bytes / partSize),
+        part_size: this.config.uploadPartSizeBytes,
+        part_count: this.partCount(dto.size_bytes),
       },
     };
+  }
+
+  async presignParts(
+    userId: string,
+    videoId: string,
+    partNumbers: number[],
+  ): Promise<PresignPartsResponseDto> {
+    const { video, uploadId } = await this.findOwnDraft(userId, videoId);
+    const partCount = this.partCount(video.size_bytes);
+    if (partNumbers.some((n) => n < 1 || n > partCount)) {
+      throw new InvalidPartNumberException(partCount);
+    }
+
+    const key = videoObjectKeys(video.id).original;
+    const expiresIn = this.config.uploadUrlTtlSeconds;
+    const parts = await Promise.all(
+      partNumbers.map(async (partNumber) => ({
+        part_number: partNumber,
+        url: await this.storageService.presignUploadPart(
+          key,
+          uploadId,
+          partNumber,
+          expiresIn,
+        ),
+      })),
+    );
+    return { parts, expires_in: expiresIn };
+  }
+
+  async listUploadedParts(
+    userId: string,
+    videoId: string,
+  ): Promise<UploadedPartsResponseDto> {
+    const { video, uploadId } = await this.findOwnDraft(userId, videoId);
+    const parts = await this.storageService.listParts(
+      videoObjectKeys(video.id).original,
+      uploadId,
+    );
+    return {
+      parts,
+      part_size: this.config.uploadPartSizeBytes,
+      part_count: this.partCount(video.size_bytes),
+    };
+  }
+
+  /** Aborts the multipart (an already gone upload is fine) and removes the draft. */
+  async cancel(userId: string, videoId: string): Promise<void> {
+    const { video, uploadId } = await this.findOwnDraft(userId, videoId);
+    await this.storageService.abortMultipartUpload(
+      videoObjectKeys(video.id).original,
+      uploadId,
+    );
+    await this.videoRepository.delete({ id: video.id });
+  }
+
+  /**
+   * Single query filtered by the caller's channel: a missing video and someone
+   * else's video both yield VIDEO_NOT_FOUND.
+   */
+  private async findOwnDraft(
+    userId: string,
+    videoId: string,
+  ): Promise<{ video: Video; uploadId: string }> {
+    const video = await this.videoRepository.findOne({
+      where: { id: videoId, channel: { user_id: userId } },
+    });
+    if (!video) {
+      throw new VideoNotFoundException();
+    }
+    if (video.status !== VideoStatus.DRAFT || !video.upload_id) {
+      throw new InvalidVideoStateException(video.status);
+    }
+    return { video, uploadId: video.upload_id };
+  }
+
+  private partCount(sizeBytes: number): number {
+    return Math.ceil(sizeBytes / this.config.uploadPartSizeBytes);
   }
 
   private async saveDraft(
