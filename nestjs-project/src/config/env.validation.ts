@@ -21,4 +21,25 @@ export const envValidationSchema = Joi.object({
   MAIL_PORT: Joi.number().default(1025),
   MAIL_FROM: Joi.string().default('"StreamTube" <noreply@streamtube.com>'),
   SWAGGER_ENABLED: Joi.string().valid('true', 'false').default('false'),
+  S3_ENDPOINT: Joi.string().uri().default('http://minio:9000'),
+  S3_PUBLIC_ENDPOINT: Joi.string().uri().default('http://localhost:9000'),
+  S3_REGION: Joi.string().default('us-east-1'),
+  S3_ACCESS_KEY: Joi.string().required(),
+  S3_SECRET_KEY: Joi.string().required(),
+  S3_BUCKET: Joi.string().default('streamtube-videos'),
+  QUEUE_HOST: Joi.string().default('valkey'),
+  QUEUE_PORT: Joi.number().port().default(6379),
+  QUEUE_PREFIX: Joi.string().default('bull'),
+  VIDEO_MAX_SIZE_BYTES: Joi.number().integer().positive().default(10737418240),
+  VIDEO_UPLOAD_PART_SIZE_BYTES: Joi.number()
+    .integer()
+    .min(5242880)
+    .default(67108864),
+  VIDEO_UPLOAD_URL_TTL_SECONDS: Joi.number().integer().positive().default(3600),
+  VIDEO_PLAYBACK_URL_TTL_SECONDS: Joi.number()
+    .integer()
+    .positive()
+    .default(14400),
+  VIDEO_ABANDONED_UPLOAD_HOURS: Joi.number().integer().positive().default(24),
+  VIDEO_PROCESSING_STALE_MINUTES: Joi.number().integer().positive().default(60),
 });
